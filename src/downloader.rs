@@ -294,3 +294,280 @@ impl Downloader {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{MockConfig, MockNntpServer, test_config};
+    use std::collections::HashMap;
+
+    fn make_article(message_id: &str, segment: u32) -> Article {
+        Article {
+            message_id: message_id.to_string(),
+            segment_number: segment,
+            bytes: 1000,
+            downloaded: false,
+            data_begin: None,
+            data_size: None,
+            crc32: None,
+            tried_servers: Vec::new(),
+            tries: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_downloader_single_article_success() {
+        let mut articles = HashMap::new();
+        articles.insert("dl1@test".into(), b"Downloaded content".to_vec());
+
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+
+        let downloader = Downloader::new(vec![config], 0);
+        let (tx, mut rx) = mpsc::channel(10);
+
+        let articles = vec![make_article("dl1@test", 1)];
+        downloader.download(articles, tx).await.unwrap();
+
+        let result = rx.recv().await.unwrap();
+        assert!(result.result.is_ok());
+        assert_eq!(result.article.message_id, "dl1@test");
+        assert!(result.server_id.is_some());
+        let data = result.result.unwrap();
+        let body = String::from_utf8_lossy(&data);
+        assert!(body.contains("Downloaded content"));
+    }
+
+    #[tokio::test]
+    async fn test_downloader_article_not_found() {
+        let server = MockNntpServer::start(MockConfig::default()).await;
+        let config = test_config(server.port());
+
+        let downloader = Downloader::new(vec![config], 0);
+        let (tx, mut rx) = mpsc::channel(10);
+
+        let articles = vec![make_article("missing@test", 1)];
+        downloader.download(articles, tx).await.unwrap();
+
+        let result = rx.recv().await.unwrap();
+        assert!(result.result.is_err());
+        assert!(matches!(
+            result.result.unwrap_err(),
+            NntpError::AllServersExhausted(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_downloader_multiple_articles() {
+        let mut articles = HashMap::new();
+        articles.insert("m1@test".into(), b"Article 1".to_vec());
+        articles.insert("m2@test".into(), b"Article 2".to_vec());
+        articles.insert("m3@test".into(), b"Article 3".to_vec());
+
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+
+        let downloader = Downloader::new(vec![config], 0);
+        let (tx, mut rx) = mpsc::channel(10);
+
+        let articles = vec![
+            make_article("m1@test", 1),
+            make_article("m2@test", 2),
+            make_article("m3@test", 3),
+        ];
+        downloader.download(articles, tx).await.unwrap();
+
+        let mut success_count = 0;
+        while let Ok(result) = rx.try_recv() {
+            if result.result.is_ok() {
+                success_count += 1;
+            }
+        }
+        assert_eq!(success_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_downloader_failover_to_second_server() {
+        // Server 1: no articles
+        let server1 = MockNntpServer::start(MockConfig::default()).await;
+        let mut config1 = test_config(server1.port());
+        config1.id = "server-1".into();
+        config1.name = "Server 1".into();
+        config1.priority = 0;
+
+        // Server 2: has the article
+        let mut articles = HashMap::new();
+        articles.insert("failover@test".into(), b"Found on server 2".to_vec());
+        let server2 = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let mut config2 = test_config(server2.port());
+        config2.id = "server-2".into();
+        config2.name = "Server 2".into();
+        config2.priority = 1;
+
+        let downloader = Downloader::new(vec![config1, config2], 0);
+        let (tx, mut rx) = mpsc::channel(10);
+
+        let articles = vec![make_article("failover@test", 1)];
+        downloader.download(articles, tx).await.unwrap();
+
+        let result = rx.recv().await.unwrap();
+        assert!(result.result.is_ok());
+        assert_eq!(result.server_id.as_deref(), Some("server-2"));
+    }
+
+    #[tokio::test]
+    async fn test_downloader_empty_article_list() {
+        let server = MockNntpServer::start(MockConfig::default()).await;
+        let config = test_config(server.port());
+
+        let downloader = Downloader::new(vec![config], 0);
+        let (tx, mut rx) = mpsc::channel(10);
+
+        downloader.download(vec![], tx).await.unwrap();
+        // No results should be sent
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_downloader_pause_resume() {
+        let downloader = Downloader::new(vec![], 0);
+
+        assert!(!downloader.is_paused());
+        downloader.pause();
+        assert!(downloader.is_paused());
+        downloader.resume();
+        assert!(!downloader.is_paused());
+    }
+
+    #[tokio::test]
+    async fn test_downloader_shutdown_signal() {
+        let mut articles = HashMap::new();
+        articles.insert("a@test".into(), b"data".to_vec());
+
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+
+        let downloader = Downloader::new(vec![config], 0);
+
+        // Shut down before downloading
+        downloader.shutdown();
+
+        let (tx, _rx) = mpsc::channel(10);
+        let result = downloader
+            .download(vec![make_article("a@test", 1)], tx)
+            .await;
+        assert!(matches!(result, Err(NntpError::Shutdown)));
+    }
+
+    #[tokio::test]
+    async fn test_downloader_disabled_servers_filtered() {
+        let server = MockNntpServer::start(MockConfig::default()).await;
+        let mut config = test_config(server.port());
+        config.enabled = false;
+
+        let downloader = Downloader::new(vec![config], 0);
+        let (tx, mut rx) = mpsc::channel(10);
+
+        let articles = vec![make_article("art@test", 1)];
+        downloader.download(articles, tx).await.unwrap();
+
+        // No servers available → AllServersExhausted
+        let result = rx.recv().await.unwrap();
+        assert!(matches!(
+            result.result.unwrap_err(),
+            NntpError::AllServersExhausted(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_downloader_priority_ordering() {
+        // Both servers have the article, but server with priority 0 should be used first
+        let mut articles = HashMap::new();
+        articles.insert("prio@test".into(), b"priority data".to_vec());
+
+        let server_high = MockNntpServer::start(MockConfig {
+            articles: articles.clone(),
+            ..MockConfig::default()
+        })
+        .await;
+        let mut config_high = test_config(server_high.port());
+        config_high.id = "high-prio".into();
+        config_high.name = "High Priority".into();
+        config_high.priority = 0;
+
+        let server_low = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let mut config_low = test_config(server_low.port());
+        config_low.id = "low-prio".into();
+        config_low.name = "Low Priority".into();
+        config_low.priority = 1;
+
+        // Pass low priority first — downloader should sort by priority
+        let downloader = Downloader::new(vec![config_low, config_high], 0);
+        let (tx, mut rx) = mpsc::channel(10);
+
+        let articles = vec![make_article("prio@test", 1)];
+        downloader.download(articles, tx).await.unwrap();
+
+        let result = rx.recv().await.unwrap();
+        assert!(result.result.is_ok());
+        assert_eq!(result.server_id.as_deref(), Some("high-prio"));
+    }
+
+    #[tokio::test]
+    async fn test_downloader_service_unavailable_penalizes() {
+        // Server 1: returns 502
+        let server1 = MockNntpServer::start(MockConfig {
+            service_unavailable: true,
+            ..MockConfig::default()
+        })
+        .await;
+        let mut config1 = test_config(server1.port());
+        config1.id = "bad-server".into();
+        config1.name = "Bad Server".into();
+        config1.priority = 0;
+
+        // Server 2: works fine
+        let mut articles = HashMap::new();
+        articles.insert("pen@test".into(), b"backup data".to_vec());
+        let server2 = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let mut config2 = test_config(server2.port());
+        config2.id = "good-server".into();
+        config2.name = "Good Server".into();
+        config2.priority = 1;
+
+        let downloader = Downloader::new(vec![config1, config2], 0);
+        let (tx, mut rx) = mpsc::channel(10);
+
+        let articles = vec![make_article("pen@test", 1)];
+        downloader.download(articles, tx).await.unwrap();
+
+        let result = rx.recv().await.unwrap();
+        assert!(result.result.is_ok());
+        // Should have fallen through to the good server
+        assert_eq!(result.server_id.as_deref(), Some("good-server"));
+    }
+}

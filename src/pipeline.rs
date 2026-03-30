@@ -346,6 +346,8 @@ impl Default for StatPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{MockConfig, MockNntpServer, test_config};
+    use std::collections::HashMap;
 
     #[test]
     fn test_pipeline_submit_and_counts() {
@@ -364,5 +366,323 @@ mod tests {
     fn test_pipeline_depth_minimum() {
         let pipe = Pipeline::new(0);
         assert_eq!(pipe.depth, 1);
+    }
+
+    #[test]
+    fn test_pipeline_depth_values() {
+        assert_eq!(Pipeline::new(1).depth, 1);
+        assert_eq!(Pipeline::new(5).depth, 5);
+        assert_eq!(Pipeline::new(255).depth, 255);
+    }
+
+    #[test]
+    fn test_pipeline_empty_after_creation() {
+        let pipe = Pipeline::new(10);
+        assert!(pipe.is_empty());
+        assert_eq!(pipe.in_flight_count(), 0);
+        assert_eq!(pipe.pending_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pipeline integration tests with mock server
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_pipeline_process_all_single_article() {
+        let mut articles = HashMap::new();
+        articles.insert("pipe1@test".into(), b"Pipeline article 1".to_vec());
+
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let mut pipeline = Pipeline::new(1);
+        pipeline.submit("pipe1@test".into(), 1);
+
+        let results = pipeline.process_all(&mut conn).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].result.is_ok());
+        assert_eq!(results[0].request.tag, 1);
+        assert_eq!(results[0].request.message_id, "pipe1@test");
+
+        let resp = results[0].result.as_ref().unwrap();
+        assert_eq!(resp.code, 220);
+        assert!(resp.data.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_process_all_multiple_articles() {
+        let mut articles = HashMap::new();
+        articles.insert("p1@test".into(), b"Body 1".to_vec());
+        articles.insert("p2@test".into(), b"Body 2".to_vec());
+        articles.insert("p3@test".into(), b"Body 3".to_vec());
+
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let mut pipeline = Pipeline::new(3);
+        pipeline.submit("p1@test".into(), 10);
+        pipeline.submit("p2@test".into(), 20);
+        pipeline.submit("p3@test".into(), 30);
+
+        let results = pipeline.process_all(&mut conn).await.unwrap();
+        assert_eq!(results.len(), 3);
+
+        // All should succeed
+        for result in &results {
+            assert!(result.result.is_ok());
+            assert_eq!(result.result.as_ref().unwrap().code, 220);
+        }
+
+        // Tags should be in order
+        assert_eq!(results[0].request.tag, 10);
+        assert_eq!(results[1].request.tag, 20);
+        assert_eq!(results[2].request.tag, 30);
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_with_missing_articles() {
+        let mut articles = HashMap::new();
+        articles.insert("exists@test".into(), b"Found it".to_vec());
+
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let mut pipeline = Pipeline::new(3);
+        pipeline.submit("exists@test".into(), 1);
+        pipeline.submit("missing@test".into(), 2);
+        pipeline.submit("exists@test".into(), 3);
+
+        let results = pipeline.process_all(&mut conn).await.unwrap();
+        assert_eq!(results.len(), 3);
+
+        // First: success
+        assert!(results[0].result.is_ok());
+        // Second: article not found
+        assert!(matches!(
+            &results[1].result,
+            Err(NntpError::ArticleNotFound(_))
+        ));
+        // Third: success (connection should recover from 430)
+        assert!(results[2].result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_depth_one_sequential() {
+        let mut articles = HashMap::new();
+        articles.insert("seq1@test".into(), b"Sequential 1".to_vec());
+        articles.insert("seq2@test".into(), b"Sequential 2".to_vec());
+
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        // Depth 1 = no pipelining, send-receive-send-receive
+        let mut pipeline = Pipeline::new(1);
+        pipeline.submit("seq1@test".into(), 1);
+        pipeline.submit("seq2@test".into(), 2);
+
+        let results = pipeline.process_all(&mut conn).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].result.is_ok());
+        assert!(results[1].result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_flush_and_receive_manually() {
+        let mut articles = HashMap::new();
+        articles.insert("manual@test".into(), b"Manual pipeline".to_vec());
+
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let mut pipeline = Pipeline::new(5);
+        pipeline.submit("manual@test".into(), 1);
+
+        // Manually flush sends
+        pipeline.flush_sends(&mut conn).await.unwrap();
+        assert_eq!(pipeline.in_flight_count(), 1);
+        assert_eq!(pipeline.pending_count(), 0);
+
+        // Manually receive
+        let result = pipeline.receive_one(&mut conn).await.unwrap();
+        assert!(result.is_some());
+        let result = result.unwrap();
+        assert!(result.result.is_ok());
+        assert_eq!(result.request.message_id, "manual@test");
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_receive_with_nothing_in_flight() {
+        let server = MockNntpServer::start(MockConfig::default()).await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let mut pipeline = Pipeline::new(5);
+        // Nothing submitted — receive_one returns None
+        let result = pipeline.receive_one(&mut conn).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_empty_process_all() {
+        let server = MockNntpServer::start(MockConfig::default()).await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let mut pipeline = Pipeline::new(5);
+        let results = pipeline.process_all(&mut conn).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // StatPipeline integration tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_stat_pipeline_all_exist() {
+        let mut articles = HashMap::new();
+        articles.insert("s1@test".into(), b"data".to_vec());
+        articles.insert("s2@test".into(), b"data".to_vec());
+        articles.insert("s3@test".into(), b"data".to_vec());
+
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let mut stat = StatPipeline::new();
+        stat.add("s1@test".into());
+        stat.add("s2@test".into());
+        stat.add("s3@test".into());
+        assert_eq!(stat.len(), 3);
+
+        let results = stat.execute(&mut conn).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.exists));
+        assert_eq!(conn.state, ConnectionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn test_stat_pipeline_mixed_results() {
+        let mut articles = HashMap::new();
+        articles.insert("found@test".into(), b"data".to_vec());
+
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let mut stat = StatPipeline::new();
+        stat.add("found@test".into());
+        stat.add("missing@test".into());
+        stat.add("found@test".into());
+
+        let results = stat.execute(&mut conn).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results[0].exists);
+        assert!(!results[1].exists);
+        assert!(results[2].exists);
+    }
+
+    #[tokio::test]
+    async fn test_stat_pipeline_none_exist() {
+        let server = MockNntpServer::start(MockConfig::default()).await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let mut stat = StatPipeline::new();
+        stat.add("no1@test".into());
+        stat.add("no2@test".into());
+
+        let results = stat.execute(&mut conn).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(!results[0].exists);
+        assert!(!results[1].exists);
+    }
+
+    #[tokio::test]
+    async fn test_stat_pipeline_empty() {
+        let server = MockNntpServer::start(MockConfig::default()).await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let mut stat = StatPipeline::new();
+        assert!(stat.is_empty());
+
+        let results = stat.execute(&mut conn).await.unwrap();
+        assert!(results.is_empty());
+        assert_eq!(conn.state, ConnectionState::Ready);
+    }
+
+    #[test]
+    fn test_stat_pipeline_default() {
+        let stat = StatPipeline::default();
+        assert!(stat.is_empty());
+        assert_eq!(stat.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_stat_pipeline_with_bracketed_ids() {
+        let mut articles = HashMap::new();
+        articles.insert("bracketed@test".into(), b"data".to_vec());
+
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let mut stat = StatPipeline::new();
+        stat.add("<bracketed@test>".into()); // already has brackets
+        stat.add("bracketed@test".into()); // without brackets
+
+        let results = stat.execute(&mut conn).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].exists);
+        assert!(results[1].exists);
     }
 }

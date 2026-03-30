@@ -42,6 +42,8 @@ pub struct MockConfig {
     pub xhdr_entries: Vec<String>,
     /// XPAT entries as pre-formatted `artnum value` lines.
     pub xpat_entries: Vec<String>,
+    /// LIST ACTIVE entries as pre-formatted `groupname last first status` lines.
+    pub list_active_entries: Vec<String>,
 }
 
 impl Default for MockConfig {
@@ -58,6 +60,7 @@ impl Default for MockConfig {
             xover_entries: Vec::new(),
             xhdr_entries: Vec::new(),
             xpat_entries: Vec::new(),
+            list_active_entries: Vec::new(),
         }
     }
 }
@@ -330,6 +333,32 @@ async fn handle_connection(stream: tokio::net::TcpStream, config: Arc<MockConfig
                         .write_all(b"221 Header data follows\r\n")
                         .await;
                     for entry in &config.xpat_entries {
+                        let _ = stream.get_mut().write_all(entry.as_bytes()).await;
+                        let _ = stream.get_mut().write_all(b"\r\n").await;
+                    }
+                    let _ = stream.get_mut().write_all(b".\r\n").await;
+                }
+            }
+
+            "LIST" => {
+                if !authenticated {
+                    let _ = stream
+                        .get_mut()
+                        .write_all(b"480 Authentication required\r\n")
+                        .await;
+                } else if config.list_active_entries.is_empty() {
+                    // Empty list is still a valid 215 response
+                    let _ = stream
+                        .get_mut()
+                        .write_all(b"215 List of newsgroups follows\r\n")
+                        .await;
+                    let _ = stream.get_mut().write_all(b".\r\n").await;
+                } else {
+                    let _ = stream
+                        .get_mut()
+                        .write_all(b"215 List of newsgroups follows\r\n")
+                        .await;
+                    for entry in &config.list_active_entries {
                         let _ = stream.get_mut().write_all(entry.as_bytes()).await;
                         let _ = stream.get_mut().write_all(b"\r\n").await;
                     }

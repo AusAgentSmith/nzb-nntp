@@ -1239,6 +1239,7 @@ fn parse_list_active_data(data: &[u8]) -> Vec<ListActiveEntry> {
 }
 
 /// Parsed SOCKS5 proxy URL components.
+#[derive(Debug)]
 struct Socks5Proxy {
     addr: String,
     auth: Option<(String, String)>,
@@ -2192,5 +2193,504 @@ mod tests {
         assert!(matches!(result, Err(crate::error::NntpError::Protocol(_))));
         // State should still be Ready since we failed before sending
         assert_eq!(conn.state, ConnectionState::Ready);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_list_active_data tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_list_active_basic() {
+        let data = b"alt.binaries.test 12345 1 y\r\nalt.binaries.misc 99999 500 n\r\n";
+        let entries = parse_list_active_data(data);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "alt.binaries.test");
+        assert_eq!(entries[0].high, 12345);
+        assert_eq!(entries[0].low, 1);
+        assert_eq!(entries[0].status, "y");
+        assert_eq!(entries[1].name, "alt.binaries.misc");
+        assert_eq!(entries[1].high, 99999);
+        assert_eq!(entries[1].low, 500);
+        assert_eq!(entries[1].status, "n");
+    }
+
+    #[test]
+    fn test_parse_list_active_moderated() {
+        let data = b"comp.lang.rust 5000 1 m\r\n";
+        let entries = parse_list_active_data(data);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, "m");
+    }
+
+    #[test]
+    fn test_parse_list_active_empty() {
+        let entries = parse_list_active_data(b"");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_list_active_skips_malformed() {
+        let data = b"too.few 100\r\nalt.valid.group 5000 1 y\r\n\r\n";
+        let entries = parse_list_active_data(data);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "alt.valid.group");
+    }
+
+    #[test]
+    fn test_parse_list_active_large_article_numbers() {
+        let data = b"alt.binaries.large 999999999999 1000000000 y\r\n";
+        let entries = parse_list_active_data(data);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].high, 999999999999);
+        assert_eq!(entries[0].low, 1000000000);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_socks5_url tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_socks5_url_basic() {
+        let proxy = parse_socks5_url("socks5://127.0.0.1:1080").unwrap();
+        assert_eq!(proxy.addr, "127.0.0.1:1080");
+        assert!(proxy.auth.is_none());
+    }
+
+    #[test]
+    fn test_parse_socks5_url_with_auth() {
+        let proxy = parse_socks5_url("socks5://user:pass@proxy.example.com:9050").unwrap();
+        assert_eq!(proxy.addr, "proxy.example.com:9050");
+        let (user, pass) = proxy.auth.unwrap();
+        assert_eq!(user, "user");
+        assert_eq!(pass, "pass");
+    }
+
+    #[test]
+    fn test_parse_socks5_url_invalid_scheme() {
+        let result = parse_socks5_url("http://127.0.0.1:1080");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("socks5://"));
+    }
+
+    #[test]
+    fn test_parse_socks5_url_missing_port() {
+        // Still valid syntax — host_port will be "127.0.0.1" (no port)
+        let proxy = parse_socks5_url("socks5://127.0.0.1").unwrap();
+        assert_eq!(proxy.addr, "127.0.0.1");
+    }
+
+    #[test]
+    fn test_parse_socks5_url_empty_host() {
+        let result = parse_socks5_url("socks5://");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_socks5_url_auth_missing_password() {
+        let result = parse_socks5_url("socks5://user@host:1080");
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Dot-stuffing / multiline body edge cases
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_article_with_dot_stuffed_body() {
+        let mut articles = HashMap::new();
+        // Body with lines starting with dots — mock server will dot-stuff them
+        articles.insert("dot@test".into(), b"Line one\n.This starts with dot\n..Two dots\nEnd".to_vec());
+
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let response = conn.fetch_article("dot@test").await.unwrap();
+        let data = response.data.unwrap();
+        let body = String::from_utf8_lossy(&data);
+        // After dot-unstuffing, dots should be restored correctly
+        assert!(body.contains(".This starts with dot"));
+        assert!(body.contains("..Two dots"));
+    }
+
+    #[tokio::test]
+    async fn test_article_empty_body() {
+        let mut articles = HashMap::new();
+        articles.insert("empty@test".into(), b"".to_vec());
+
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let response = conn.fetch_article("empty@test").await.unwrap();
+        assert_eq!(response.code, 220);
+        // Body should exist but be minimal (just the blank line from mock)
+        assert!(response.data.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Compression helper tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compression_flag_defaults_off() {
+        let conn = NntpConnection::new("test".into());
+        assert!(!conn.is_compress_enabled());
+    }
+
+    #[test]
+    fn test_disable_compression() {
+        let mut conn = NntpConnection::new("test".into());
+        conn.compress_enabled = true;
+        assert!(conn.is_compress_enabled());
+        conn.disable_compression();
+        assert!(!conn.is_compress_enabled());
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth edge cases
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_auth_required_but_no_credentials() {
+        let server = MockNntpServer::start(MockConfig {
+            auth_required: true,
+            ..MockConfig::default()
+        })
+        .await;
+        // Config without credentials
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+
+        // Should connect and be ready (no creds → no AUTH attempt)
+        // but commands will get 480
+        conn.connect(&config).await.unwrap();
+        assert_eq!(conn.state, ConnectionState::Ready);
+
+        // GROUP should trigger 480 from the mock
+        let result = conn.group("alt.test").await;
+        assert!(matches!(
+            result,
+            Err(crate::error::NntpError::AuthRequired(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_auth_any_credentials_accepted() {
+        let server = MockNntpServer::start(MockConfig {
+            auth_required: true,
+            valid_credentials: None, // None = accept anything
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config_with_auth(server.port(), "any_user", "any_pass");
+        let mut conn = NntpConnection::new("test".into());
+
+        conn.connect(&config).await.unwrap();
+        assert_eq!(conn.state, ConnectionState::Ready);
+    }
+
+    // -----------------------------------------------------------------------
+    // LIST ACTIVE mock server tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_list_active_success() {
+        let list_active_entries = vec![
+            "alt.binaries.test 50000 1 y".into(),
+            "alt.binaries.misc 99999 500 n".into(),
+            "comp.lang.rust 3000 1 m".into(),
+        ];
+
+        let server = MockNntpServer::start(MockConfig {
+            list_active_entries,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let entries = conn.list_active(None).await.unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].name, "alt.binaries.test");
+        assert_eq!(entries[0].high, 50000);
+        assert_eq!(entries[0].low, 1);
+        assert_eq!(entries[0].status, "y");
+        assert_eq!(entries[1].name, "alt.binaries.misc");
+        assert_eq!(entries[1].status, "n");
+        assert_eq!(entries[2].status, "m");
+        assert_eq!(conn.state, ConnectionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn test_list_active_empty() {
+        let server = MockNntpServer::start(MockConfig::default()).await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        let entries = conn.list_active(None).await.unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(conn.state, ConnectionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn test_list_active_with_wildmat() {
+        let list_active_entries = vec![
+            "alt.binaries.test 1000 1 y".into(),
+        ];
+
+        let server = MockNntpServer::start(MockConfig {
+            list_active_entries,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        // Wildmat is sent but mock doesn't filter — just tests command formatting
+        let entries = conn.list_active(Some("alt.binaries.*")).await.unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Message-ID normalization edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_message_id_empty() {
+        assert_eq!(normalize_message_id(""), "<>");
+    }
+
+    #[test]
+    fn test_normalize_message_id_only_angle_brackets() {
+        assert_eq!(normalize_message_id("<>"), "<>");
+    }
+
+    #[test]
+    fn test_normalize_message_id_partial_brackets() {
+        // Only opening bracket — not recognized as wrapped
+        assert_eq!(normalize_message_id("<abc@test"), "<<abc@test>");
+        // Only closing bracket
+        assert_eq!(normalize_message_id("abc@test>"), "<abc@test>>");
+    }
+
+    // -----------------------------------------------------------------------
+    // Response line edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_response_line_with_extra_spaces() {
+        let resp = parse_response_line("200  Multiple  Spaces\r\n").unwrap();
+        assert_eq!(resp.code, 200);
+        assert_eq!(resp.message, " Multiple  Spaces");
+    }
+
+    #[test]
+    fn test_parse_response_line_bare_lf() {
+        let resp = parse_response_line("200 OK\n").unwrap();
+        assert_eq!(resp.code, 200);
+        assert_eq!(resp.message, "OK");
+    }
+
+    #[test]
+    fn test_parse_response_line_all_status_codes() {
+        // Verify we can parse common NNTP codes
+        for &(code, msg) in &[
+            (200, "Service available, posting allowed"),
+            (201, "Service available, posting prohibited"),
+            (205, "Closing connection"),
+            (211, "1234 5 6789 alt.test"),
+            (215, "List of newsgroups follows"),
+            (220, "0 <msg@id> Article follows"),
+            (221, "Header follows"),
+            (222, "0 <msg@id> Body follows"),
+            (223, "0 <msg@id> Article exists"),
+            (224, "Overview information follows"),
+            (281, "Authentication accepted"),
+            (290, "Compression enabled"),
+            (381, "Password required"),
+            (411, "No such newsgroup"),
+            (412, "No newsgroup selected"),
+            (420, "No article selected"),
+            (430, "No such article"),
+            (480, "Authentication required"),
+            (481, "Authentication rejected"),
+            (482, "Authentication rejected (temp)"),
+            (500, "Command not recognized"),
+            (502, "Service permanently unavailable"),
+        ] {
+            let line = format!("{code} {msg}\r\n");
+            let resp = parse_response_line(&line).unwrap();
+            assert_eq!(resp.code, code);
+            assert_eq!(resp.message, msg);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // XOVER parsing edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_xover_with_extra_fields() {
+        // Some servers include additional fields beyond the standard 8
+        let data = b"100\tSubj\tFrom\tDate\t<mid@x>\trefs\t500\t50\textra1\textra2\r\n";
+        let entries = parse_xover_data(data);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].article_num, 100);
+        assert_eq!(entries[0].lines, 50);
+    }
+
+    #[test]
+    fn test_parse_xover_unparseable_numbers() {
+        let data = b"notnum\tSubj\tFrom\tDate\t<mid@x>\trefs\tnotnum\tnotnum\r\n";
+        let entries = parse_xover_data(data);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].article_num, 0); // unwrap_or(0)
+        assert_eq!(entries[0].bytes, 0);
+        assert_eq!(entries[0].lines, 0);
+    }
+
+    #[test]
+    fn test_parse_xover_message_id_without_brackets() {
+        let data = b"1\tSubj\tFrom\tDate\tmid@noBrackets\trefs\t100\t10\r\n";
+        let entries = parse_xover_data(data);
+        assert_eq!(entries[0].message_id, "mid@noBrackets");
+    }
+
+    // -----------------------------------------------------------------------
+    // Connection state checks
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_connection_state_equality() {
+        assert_eq!(ConnectionState::Disconnected, ConnectionState::Disconnected);
+        assert_ne!(ConnectionState::Ready, ConnectionState::Busy);
+        assert_ne!(ConnectionState::Error, ConnectionState::Ready);
+    }
+
+    #[test]
+    fn test_is_connected_when_disconnected() {
+        let conn = NntpConnection::new("test".into());
+        assert!(!conn.is_connected());
+        assert_eq!(conn.state, ConnectionState::Disconnected);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sequential command flow tests (RFC 3977 state machine)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_group_then_xover_then_article() {
+        let mut groups = HashMap::new();
+        groups.insert("alt.test".into(), (10u64, 1u64, 10u64));
+
+        let mut articles = HashMap::new();
+        articles.insert("a1@test".into(), b"Article one body".to_vec());
+
+        let xover_entries = vec![
+            "1\tSubject\tposter@x\tDate\t<a1@test>\t\t1000\t20".into(),
+        ];
+
+        let server = MockNntpServer::start(MockConfig {
+            groups,
+            articles,
+            xover_entries,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        // 1. Select group (RFC 3977 §6.1.1)
+        let group = conn.group("alt.test").await.unwrap();
+        assert_eq!(group.count, 10);
+
+        // 2. Get overview (RFC 2980 §2.8)
+        let overview = conn.xover(1, 10).await.unwrap();
+        assert_eq!(overview.len(), 1);
+        assert_eq!(overview[0].message_id, "a1@test");
+
+        // 3. Fetch article using message-id from overview
+        let article = conn.fetch_article(&overview[0].message_id).await.unwrap();
+        assert_eq!(article.code, 220);
+        let data = article.data.unwrap();
+        let body = String::from_utf8_lossy(&data);
+        assert!(body.contains("Article one body"));
+    }
+
+    #[tokio::test]
+    async fn test_stat_then_article_workflow() {
+        let mut articles = HashMap::new();
+        articles.insert("check@test".into(), b"fetched after stat".to_vec());
+
+        let server = MockNntpServer::start(MockConfig {
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config(server.port());
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        // STAT to check existence first
+        let stat = conn.stat_article("check@test").await.unwrap();
+        assert_eq!(stat.code, 223);
+
+        // Then fetch
+        let art = conn.fetch_article("check@test").await.unwrap();
+        assert_eq!(art.code, 220);
+        assert!(String::from_utf8_lossy(&art.data.unwrap()).contains("fetched after stat"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth-gated command tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_commands_after_successful_auth() {
+        let mut groups = HashMap::new();
+        groups.insert("alt.test".into(), (50u64, 1u64, 50u64));
+
+        let mut articles = HashMap::new();
+        articles.insert("authed@test".into(), b"secured data".to_vec());
+
+        let server = MockNntpServer::start(MockConfig {
+            auth_required: true,
+            valid_credentials: Some(("user".into(), "pass".into())),
+            groups,
+            articles,
+            ..MockConfig::default()
+        })
+        .await;
+        let config = test_config_with_auth(server.port(), "user", "pass");
+        let mut conn = NntpConnection::new("test".into());
+        conn.connect(&config).await.unwrap();
+
+        // All commands should work after auth
+        let group = conn.group("alt.test").await.unwrap();
+        assert_eq!(group.count, 50);
+
+        let stat = conn.stat_article("authed@test").await.unwrap();
+        assert_eq!(stat.code, 223);
+
+        let art = conn.fetch_article("authed@test").await.unwrap();
+        assert_eq!(art.code, 220);
+
+        let body = conn.fetch_body("authed@test").await.unwrap();
+        assert_eq!(body.code, 222);
     }
 }
