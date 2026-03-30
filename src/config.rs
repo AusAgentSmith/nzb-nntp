@@ -101,3 +101,104 @@ pub struct Article {
     /// Number of fetch attempts
     pub tries: u32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_article_serde_roundtrip() {
+        let article = Article {
+            message_id: "abc123@example.com".to_string(),
+            segment_number: 1,
+            bytes: 500_000,
+            downloaded: false,
+            data_begin: Some(0),
+            data_size: Some(499_000),
+            crc32: Some(0xDEADBEEF),
+            tried_servers: vec!["server1".to_string()],
+            tries: 2,
+        };
+
+        let json = serde_json::to_string(&article).unwrap();
+        let deserialized: Article = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.message_id, "abc123@example.com");
+        assert_eq!(deserialized.segment_number, 1);
+        assert_eq!(deserialized.bytes, 500_000);
+        assert!(!deserialized.downloaded);
+        assert_eq!(deserialized.data_begin, Some(0));
+        assert_eq!(deserialized.data_size, Some(499_000));
+        assert_eq!(deserialized.crc32, Some(0xDEADBEEF));
+        assert_eq!(deserialized.tried_servers, vec!["server1"]);
+        assert_eq!(deserialized.tries, 2);
+    }
+
+    #[test]
+    fn test_server_config_serde_roundtrip() {
+        let config = ServerConfig {
+            id: "srv1".to_string(),
+            name: "My Server".to_string(),
+            host: "news.example.com".to_string(),
+            port: 563,
+            ssl: true,
+            ssl_verify: true,
+            username: Some("user".to_string()),
+            password: Some("pass".to_string()),
+            connections: 8,
+            priority: 0,
+            enabled: true,
+            retention: 3000,
+            pipelining: 20,
+            optional: false,
+            compress: true,
+            proxy_url: Some("socks5://proxy:1080".to_string()),
+        };
+
+        let toml_str = toml::to_string(&config).unwrap();
+        let deserialized: ServerConfig = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(deserialized.id, "srv1");
+        assert_eq!(deserialized.host, "news.example.com");
+        assert_eq!(deserialized.port, 563);
+        assert!(deserialized.ssl);
+        assert_eq!(deserialized.connections, 8);
+        assert_eq!(deserialized.retention, 3000);
+        assert!(deserialized.compress);
+        assert_eq!(deserialized.proxy_url, Some("socks5://proxy:1080".to_string()));
+    }
+
+    #[test]
+    fn test_server_config_defaults() {
+        let config = ServerConfig::default();
+        assert_eq!(config.port, 563);
+        assert!(config.ssl);
+        assert!(config.ssl_verify);
+        assert_eq!(config.connections, 4);
+        assert_eq!(config.priority, 0);
+        assert!(config.enabled);
+        assert_eq!(config.retention, 0);
+        assert_eq!(config.pipelining, 20);
+        assert!(!config.optional);
+        assert!(!config.compress);
+        assert!(config.proxy_url.is_none());
+    }
+
+    #[test]
+    fn test_list_active_entry_serde() {
+        let entry = ListActiveEntry {
+            name: "alt.binaries.test".to_string(),
+            high: 1_000_000,
+            low: 1,
+            status: "y".to_string(),
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let deserialized: ListActiveEntry = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.name, "alt.binaries.test");
+        assert_eq!(deserialized.high, 1_000_000);
+        assert_eq!(deserialized.low, 1);
+        assert_eq!(deserialized.status, "y");
+    }
+}
