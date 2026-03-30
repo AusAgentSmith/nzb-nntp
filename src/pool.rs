@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::sync::Semaphore;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::config::ServerConfig;
 
@@ -52,17 +52,26 @@ pub struct ConnectionPool {
     semaphore: Arc<Semaphore>,
     /// Total connections ever created (for naming/debug).
     created_count: Mutex<u32>,
+    /// Timestamp of the last new connection creation (for ramp-up staggering).
+    /// Uses `tokio::sync::Mutex` because it is held across an `.await` (the sleep).
+    last_connect: tokio::sync::Mutex<Instant>,
+    /// Minimum delay between new connection creations.
+    ramp_up_delay: Duration,
 }
 
 impl ConnectionPool {
     /// Create a new pool for the given server. No connections are opened yet.
     pub fn new(config: Arc<ServerConfig>) -> Self {
         let max_conns = config.connections as usize;
+        let ramp_up_delay = Duration::from_millis(config.ramp_up_delay_ms as u64);
         Self {
-            config,
             idle: Mutex::new(Vec::with_capacity(max_conns)),
             semaphore: Arc::new(Semaphore::new(max_conns)),
             created_count: Mutex::new(0),
+            // Allow the first connection immediately
+            last_connect: tokio::sync::Mutex::new(Instant::now() - Duration::from_secs(60)),
+            ramp_up_delay,
+            config,
         }
     }
 
@@ -198,12 +207,45 @@ impl ConnectionPool {
         self.semaphore.available_permits()
     }
 
+    /// Wait for the ramp-up delay to elapse since the last connection was opened.
+    ///
+    /// Call this before creating a connection outside the pool (e.g. in download
+    /// engine workers) to respect ramp-up timing and avoid connection bursts.
+    pub async fn wait_for_ramp_up(&self) {
+        if self.ramp_up_delay.is_zero() {
+            return;
+        }
+        let mut last = self.last_connect.lock().await;
+        let elapsed = last.elapsed();
+        if elapsed < self.ramp_up_delay {
+            let wait = self.ramp_up_delay - elapsed;
+            trace!(
+                server = %self.config.name,
+                wait_ms = wait.as_millis(),
+                "Ramp-up: waiting before new connection"
+            );
+            tokio::time::sleep(wait).await;
+        }
+        *last = Instant::now();
+    }
+
+    /// The configured ramp-up delay between new connections.
+    pub fn ramp_up_delay(&self) -> Duration {
+        self.ramp_up_delay
+    }
+
     // ------------------------------------------------------------------
     // Internal
     // ------------------------------------------------------------------
 
     /// Create and connect a new NNTP connection.
+    ///
+    /// Applies ramp-up delay to stagger connection establishment and avoid
+    /// bursting the server with simultaneous TCP+TLS handshakes.
     async fn create_connection(&self) -> NntpResult<NntpConnection> {
+        // Enforce ramp-up delay between new connections
+        self.wait_for_ramp_up().await;
+
         let idx = {
             let mut count = self.created_count.lock();
             *count += 1;
