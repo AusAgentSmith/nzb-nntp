@@ -56,7 +56,7 @@ impl Default for ServerConfig {
             priority: 0,
             enabled: true,
             retention: 0,
-            pipelining: 1,
+            pipelining: 20,
             optional: false,
             compress: false,
             proxy_url: None,
