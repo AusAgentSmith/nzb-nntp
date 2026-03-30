@@ -64,6 +64,21 @@ impl Default for ServerConfig {
     }
 }
 
+/// Entry from `LIST ACTIVE` response.
+///
+/// Each line: `groupname last first posting_flag`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListActiveEntry {
+    /// Newsgroup name (e.g., "alt.binaries.test")
+    pub name: String,
+    /// Highest article number
+    pub high: u64,
+    /// Lowest article number
+    pub low: u64,
+    /// Posting flag (y = posting allowed, n = no posting, m = moderated)
+    pub status: String,
+}
+
 /// A Usenet article segment to be downloaded.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Article {

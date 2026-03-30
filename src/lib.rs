@@ -20,7 +20,7 @@ pub mod server;
 #[cfg(test)]
 pub(crate) mod testutil;
 
-pub use config::{Article, ServerConfig};
+pub use config::{Article, ListActiveEntry, ServerConfig};
 pub use connection::{
     ArticleRange, ConnectionState, GroupResponse, HeaderEntry, NntpConnection, NntpResponse,
     XoverEntry,
