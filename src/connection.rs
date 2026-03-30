@@ -996,6 +996,81 @@ impl NntpConnection {
     }
 
     // ------------------------------------------------------------------
+    // POST (RFC 3977 Section 6.3.1)
+    // ------------------------------------------------------------------
+
+    /// Post an article to the server.
+    ///
+    /// The `article` parameter should be a complete article including headers
+    /// and body, separated by a blank line. Headers must include at least
+    /// From, Newsgroups, and Subject.
+    ///
+    /// Returns the server's response after posting.
+    /// Response code 240 = article posted successfully.
+    /// Response code 440 = posting not permitted.
+    /// Response code 441 = posting failed.
+    pub async fn post_article(&mut self, article: &str) -> NntpResult<NntpResponse> {
+        if self.state != ConnectionState::Ready {
+            return Err(NntpError::Protocol(format!(
+                "Cannot POST in state {:?}",
+                self.state
+            )));
+        }
+        self.state = ConnectionState::Busy;
+
+        // Send POST command
+        self.send_command("POST").await?;
+        let status = self.read_response_line().await?;
+
+        match status.code {
+            340 => {
+                // Server says "send article"
+                // Send each line, dot-stuffing lines that start with '.'
+                let transport = self
+                    .transport
+                    .as_mut()
+                    .ok_or(NntpError::Connection("Not connected".into()))?;
+
+                for line in article.lines() {
+                    if line.starts_with('.') {
+                        transport
+                            .write_all(format!(".{line}\r\n").as_bytes())
+                            .await
+                            .map_err(NntpError::Io)?;
+                    } else {
+                        transport
+                            .write_all(format!("{line}\r\n").as_bytes())
+                            .await
+                            .map_err(NntpError::Io)?;
+                    }
+                }
+
+                // Send termination line
+                transport
+                    .write_all(b".\r\n")
+                    .await
+                    .map_err(NntpError::Io)?;
+
+                // Read final response
+                let result = self.read_response_line().await?;
+                self.state = ConnectionState::Ready;
+                Ok(result)
+            }
+            440 => {
+                self.state = ConnectionState::Ready;
+                Ok(status) // Posting not permitted
+            }
+            _ => {
+                self.state = ConnectionState::Error;
+                Err(NntpError::Protocol(format!(
+                    "Unexpected POST response {}: {}",
+                    status.code, status.message
+                )))
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // QUIT
     // ------------------------------------------------------------------
 
